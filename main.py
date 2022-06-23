@@ -1,6 +1,7 @@
 from fastapi import FastAPI, File, HTTPException, UploadFile, Form, status, Body, Cookie, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
 from keras.models import load_model
 from pymongo import MongoClient
 from pydantic import BaseModel
@@ -17,7 +18,6 @@ db = mgClient['food-classification']
 usersCollection = db['users']
 model = load_model("./model.hdf5")
 class_names = open("./class_names.txt", "r").readlines()
-
 
 origins = [
     "http://localhost",
@@ -40,38 +40,39 @@ class JWTAuth:
         return jwt.encode(
             {"exp": datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(hours=1), "subject": subject},
             self.key,
-        )
+        ).decode("utf-8")
 
     def create_refresh_token(self, subject):
         return jwt.encode(
             {"exp": datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(days=30), "subject": subject},
             self.key,
-        )
+        ).decode("utf-8")
 
     def refresh_token(self, refresh_token):
-        subject = jwt.decode(refresh_token, self.key)
+        subject = jwt.decode(refresh_token.encode("utf-8"), self.key)["subject"]
         return self.create_access_token(subject)
 
     def decode(self, token):
-        return jwt.decode(token, self.key)["subject"]
+        return jwt.decode(token.encode("utf-8"), self.key)["subject"]
+
+    #Unused, but helpful.
+    def get_token_exp(self, token):
+        return str(datetime.datetime.fromtimestamp(jwt.decode(token.encode("utf-8"), self.key)["exp"]))
 
     def check_token(self, token):
         try:
-            jwt.decode(token, self.key)
+            jwt.decode(token.encode("utf-8"), self.key)
             return True
         except jwt.ExpiredSignatureError:
             return False
         except jwt.exceptions.DecodeError:
             return False
+        except AttributeError:
+            return False
 
     def login_required(self, access_token = Cookie(None)):
         if self.check_token(access_token) == False:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Failed to authorize!")
-
-    #For the login route.
-    def logged_in_not_allowed(self, access_token=Cookie(None)):
-        if self.check_token(access_token):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Authorized cannot access this route!")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Failed to authorize!")
 
 # IN PPRODUCTION THIS SHOULD BE STORED IN AN ENV VARIABLE.
 jwt_helper = JWTAuth("p7BHaDz1oWmaB13HOTotwq4Y4F+Bns/K")
@@ -86,45 +87,59 @@ def signup(email: str = Body(...), password:str = Body(...)):
     else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User already exists!")        
 
-@app.post("/authenticate", dependencies=[Depends(jwt_helper.logged_in_not_allowed)])
+@app.post("/authenticate")
 def authenticate(email: str = Body(...), password:str = Body(...)):
     if (user := usersCollection.find_one({"email": email})) != None:
         if bcrypt.checkpw(password.encode(), user["password"]):
             access_token = jwt_helper.create_access_token({"email": email})
             refresh_token = jwt_helper.create_refresh_token({"email": email})
-            response = JSONResponse(content={"status": "ok!"}, status_code=status.HTTP_200_OK)
-            response.set_cookie(key="access_token", value=access_token.decode("utf-8"), httponly=True)
-            response.set_cookie(key="refresh_token", value=refresh_token.decode("utf-8"), httponly=True)
+            response = JSONResponse(content=jsonable_encoder({"email": email}), status_code=status.HTTP_200_OK)
+            response.set_cookie(key="access_token", value=access_token, httponly=True, max_age=datetime.timedelta(hours=1).total_seconds(), expires=datetime.timedelta(hours=1).total_seconds())
+            response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, max_age=datetime.timedelta(days=30).total_seconds(), expires=datetime.timedelta(days=30).total_seconds())
             return response
             #Authenticated.
         else:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Failed to authenticate!")
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Failed to authenticate!")
             #Failed to authenticate, passwords don't match.
     else:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found!")
+        #User not found.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Failed to authenticate")
+
+@app.get("/logout")
+def logout():
+    response = JSONResponse(content=jsonable_encoder({"status": "ok!"}), status_code=status.HTTP_200_OK)
+    response.delete_cookie(key="access_token")
+    response.delete_cookie(key="refresh_token")
+    return response
 
 #Refresh route shouldn't be protected
 #Because, if the access token is invalid,
 #Then the user wouldn't even be able to refresh it.
 @app.get("/refresh")
 def refresh(refresh_token = Cookie(None)):
-    try:
-        new_access_token = jwt_helper.refresh_token(refresh_token)
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Refresh token expired!")
+    if refresh_token != None:
+        try:
+            user = jwt_helper.decode(refresh_token)
+            new_access_token = jwt_helper.refresh_token(refresh_token)
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired!")
+        response = JSONResponse(content=jsonable_encoder(user), status_code=status.HTTP_200_OK)
+        response.set_cookie(key="access_token", value=new_access_token, httponly=True, max_age=datetime.timedelta(hours=1).total_seconds(), expires=datetime.timedelta(hours=1).total_seconds())
         return response
-    response = JSONResponse(content={"status": "ok!"}, status_code=status.HTTP_200_OK)
-    response.set_cookie(key="access_token", value=new_access_token, httponly=True)
-    return response
+    else:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token!")
 
 @app.get("/users/me")
 def get_current_user(access_token = Cookie(None)):
-    if jwt_helper.check_token(access_token):
-        current_user = jwt_helper.decode(access_token)
-        response = JSONResponse(content=current_user, status_code=status.HTTP_200_OK)
-        return response
+    if access_token != None:
+        if jwt_helper.check_token(access_token):
+            current_user = jwt_helper.decode(access_token)
+            response = JSONResponse(content=current_user, status_code=status.HTTP_200_OK)
+            return response
+        else:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired!")
     else:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token expired!")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token!")
 
 
 @app.post("/classify", dependencies=[Depends(jwt_helper.login_required)])
