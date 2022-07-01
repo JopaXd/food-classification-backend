@@ -104,7 +104,7 @@ def authenticate(email: str = Body(...), password:str = Body(...)):
             #Failed to authenticate, passwords don't match.
     else:
         #User not found.
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Failed to authenticate")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Failed to authenticate")
 
 @app.get("/logout")
 def logout():
