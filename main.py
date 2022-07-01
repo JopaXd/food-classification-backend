@@ -4,7 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from keras.models import load_model
 from pymongo import MongoClient
-from pydantic import BaseModel
 from PIL import Image
 import numpy as np
 import bcrypt
@@ -16,6 +15,7 @@ app = FastAPI()
 mgClient = MongoClient('localhost', 27017)
 db = mgClient['food-classification']
 usersCollection = db['users']
+likedPostsCollection = db["liked_posts"]
 model = load_model("./model.hdf5")
 class_names = open("./class_names.txt", "r").readlines()
 
@@ -91,9 +91,10 @@ def signup(email: str = Body(...), password:str = Body(...)):
 def authenticate(email: str = Body(...), password:str = Body(...)):
     if (user := usersCollection.find_one({"email": email})) != None:
         if bcrypt.checkpw(password.encode(), user["password"]):
-            access_token = jwt_helper.create_access_token({"email": email})
-            refresh_token = jwt_helper.create_refresh_token({"email": email})
-            response = JSONResponse(content=jsonable_encoder({"email": email}), status_code=status.HTTP_200_OK)
+            user_obj = {"email": email, "id": str(user["_id"])}
+            access_token = jwt_helper.create_access_token(user_obj)
+            refresh_token = jwt_helper.create_refresh_token(user_obj)
+            response = JSONResponse(content=jsonable_encoder(user_obj), status_code=status.HTTP_200_OK)
             response.set_cookie(key="access_token", value=access_token, httponly=True, max_age=datetime.timedelta(hours=1).total_seconds(), expires=datetime.timedelta(hours=1).total_seconds())
             response.set_cookie(key="refresh_token", value=refresh_token, httponly=True, max_age=datetime.timedelta(days=30).total_seconds(), expires=datetime.timedelta(days=30).total_seconds())
             return response
@@ -129,17 +130,11 @@ def refresh(refresh_token = Cookie(None)):
     else:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token!")
 
-@app.get("/users/me")
+@app.get("/users/me", dependencies=[Depends(jwt_helper.login_required)])
 def get_current_user(access_token = Cookie(None)):
-    if access_token != None:
-        if jwt_helper.check_token(access_token):
-            current_user = jwt_helper.decode(access_token)
-            response = JSONResponse(content=current_user, status_code=status.HTTP_200_OK)
-            return response
-        else:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired!")
-    else:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token!")
+    current_user = jwt_helper.decode(access_token)
+    response = JSONResponse(content=current_user, status_code=status.HTTP_200_OK)
+    return response
 
 
 @app.post("/classify", dependencies=[Depends(jwt_helper.login_required)])
@@ -152,3 +147,35 @@ def classify_image(img: UploadFile = File(...)):
     prediction = model.predict(img)
     result = class_names[np.argmax(prediction)].rstrip()
     return {"prediction" : result}
+
+@app.get("/liked_posts/me", dependencies=[Depends(jwt_helper.login_required)])
+def liked_posts_me(access_token = Cookie(None)):
+    current_user = jwt_helper.decode(access_token)
+    liked_posts = list(likedPostsCollection.find({"userId": current_user["id"]}))
+    #Getting rid ObjectId, not necessary for the request result.
+    for post in liked_posts:
+        del post["_id"]
+    response = JSONResponse(content=jsonable_encoder({"posts": liked_posts}), status_code=status.HTTP_200_OK)
+    return response
+
+@app.post("/like", dependencies=[Depends(jwt_helper.login_required)])
+def like_post(post_id: int = Body(embed=True, default=None), access_token = Cookie(None)):
+    current_user = jwt_helper.decode(access_token)
+    if likedPostsCollection.find_one({"userId": current_user["id"], "postId": post_id}) == None:
+        likedPostsCollection.insert_one({"userId": current_user["id"], "postId": post_id})
+        response = JSONResponse(content=jsonable_encoder({"status": "ok!"}), status_code=status.HTTP_200_OK)
+        return response
+    else:
+        response = JSONResponse(content=jsonable_encoder({"status": "This user already liked this post!"}), status_code=status.HTTP_400_BAD_REQUEST)
+        return response
+
+@app.delete("/dislike", dependencies=[Depends(jwt_helper.login_required)])
+def dislike_post(post_id: int = Body(embed=True, default=None), access_token = Cookie(None)):
+    current_user = jwt_helper.decode(access_token)
+    if (likedPost := likedPostsCollection.find_one({"userId": current_user["id"], "postId": post_id})) != None:
+        likedPostsCollection.delete_one(likedPost)
+        response = JSONResponse(content=jsonable_encoder({"status": "ok!"}), status_code=status.HTTP_200_OK)
+        return response
+    else:
+        response = JSONResponse(content=jsonable_encoder({"status": "This user has not liked this post!"}), status_code=status.HTTP_400_BAD_REQUEST)
+        return response
